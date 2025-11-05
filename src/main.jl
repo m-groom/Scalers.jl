@@ -213,7 +213,9 @@ function MMI.fit(transformer::QuantileTransformer, verbosity::Int, X)
         col_array = _collect_numeric_column(col_data, T)
 
         if any(isinf, col_array)
-            error("Feature $(name) contains ±Inf values which QuantileTransformer cannot handle.")
+            error(
+                "Feature $(name) contains ±Inf values which QuantileTransformer cannot handle.",
+            )
         end
 
         finite_mask = .!isnan.(col_array)
@@ -227,7 +229,9 @@ function MMI.fit(transformer::QuantileTransformer, verbosity::Int, X)
             continue
         end
 
-        quantiles, probabilities = _compute_quantile_grid(numeric_col_data, transformer.n_quantiles)
+        quantiles, probabilities = _compute_quantile_grid(
+            numeric_col_data, transformer.n_quantiles
+        )
         quantiles_per_column[col_idx] = quantiles
         probabilities_per_column[col_idx] = probabilities
 
@@ -284,7 +288,7 @@ function MMI.transform(transformer::QuantileTransformer, fitresult, Xnew)
                 continue
             elseif !isfinite(val)
                 error(
-                    "Input to QuantileTransformer contains ±Inf values which are not supported."
+                    "Input to QuantileTransformer contains ±Inf values which are not supported.",
                 )
             end
 
@@ -296,7 +300,8 @@ function MMI.transform(transformer::QuantileTransformer, fitresult, Xnew)
                 _value_to_probability(val, current_quantiles, current_probabilities)
             end
 
-            scaled_val = range_span == 0.0 ? min_range : probability * range_span + min_range
+            scaled_val =
+                range_span == 0.0 ? min_range : probability * range_span + min_range
             new_col[i] = T(scaled_val)
         end
 
@@ -353,7 +358,7 @@ function MMI.inverse_transform(transformer::QuantileTransformer, fitresult, Xtra
                 continue
             elseif !isfinite(s_val)
                 error(
-                    "Input to QuantileTransformer.inverse_transform contains ±Inf values which are not supported."
+                    "Input to QuantileTransformer.inverse_transform contains ±Inf values which are not supported.",
                 )
             end
 
@@ -401,7 +406,9 @@ function _collect_numeric_column(column_data, T::Type{<:AbstractFloat})
     return result
 end
 
-function _compute_quantile_grid(values::Vector{T}, n_quantiles::Int) where {T<:AbstractFloat}
+function _compute_quantile_grid(
+    values::Vector{T}, n_quantiles::Int
+) where {T<:AbstractFloat}
     sorted_vals = sort(values)
     n_samples = length(sorted_vals)
     n_quantiles_eff = max(2, min(n_quantiles, n_samples))

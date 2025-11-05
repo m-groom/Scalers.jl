@@ -216,8 +216,7 @@ end
 
     @testset "Repeated values" begin
         X_repeated_table = (
-            a=[1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
-            b=[10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+            a=[1.0, 1.0, 2.0, 2.0, 3.0, 3.0], b=[10.0, 9.0, 8.0, 7.0, 6.0, 5.0]
         )
         X_repeated = MLJBase.table(X_repeated_table)
         transformer = QuantileTransformer()
