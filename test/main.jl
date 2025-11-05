@@ -214,6 +214,34 @@ end
         end
     end
 
+    @testset "Repeated values" begin
+        X_repeated_table = (
+            a=[1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+            b=[10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+        )
+        X_repeated = MLJBase.table(X_repeated_table)
+        transformer = QuantileTransformer()
+        mach = machine(transformer, X_repeated)
+        fit!(mach; verbosity=0)
+
+        X_transformed = transform(mach, X_repeated)
+        a_transformed = Tables.getcolumn(X_transformed, :a)
+
+        @test a_transformed[1] ≈ a_transformed[2] atol = 1e-9
+        @test a_transformed[3] ≈ a_transformed[4] atol = 1e-9
+        @test a_transformed[5] ≈ a_transformed[6] atol = 1e-9
+        @test issorted(a_transformed)
+        @test minimum(a_transformed) ≥ -1e-9
+        @test maximum(a_transformed) ≤ 1.0 + 1e-9
+
+        X_restored = inverse_transform(mach, X_transformed)
+        for col_name in Tables.columnnames(X_repeated)
+            original_col = Tables.getcolumn(X_repeated, col_name)
+            restored_col = Tables.getcolumn(X_restored, col_name)
+            @test original_col ≈ restored_col atol = 1e-9
+        end
+    end
+
     @testset "Out-of-sample data" begin
         transformer = QuantileTransformer()
         mach = machine(transformer, X_qt)
@@ -224,11 +252,9 @@ end
         X_transformed = transform(mach, X_new)
 
         # Values outside fitted range should be clamped to feature_range bounds
-        @test Tables.getcolumn(X_transformed, :a)[1] ≈ 0.0 atol = 1e-9 # 0.0 < min(X_qt.a)
-        @test Tables.getcolumn(X_transformed, :a)[3] ≈ 1.0 atol = 1e-9 # 11.0 > max(X_qt.a)
-        # 12.0 > max(X_qt.b) -> smallest rank, maps to 1 for reversed
+        @test Tables.getcolumn(X_transformed, :a)[1] ≈ 0.0 atol = 1e-9
+        @test Tables.getcolumn(X_transformed, :a)[3] ≈ 1.0 atol = 1e-9
         @test Tables.getcolumn(X_transformed, :b)[1] ≈ 1.0 atol = 1e-9
-        # -1.0 < min(X_qt.b) -> largest rank, maps to 0 for reversed
         @test Tables.getcolumn(X_transformed, :b)[3] ≈ 0.0 atol = 1e-9
 
         # Inverse transform for out-of-sample (especially clamped values)
@@ -274,21 +300,54 @@ end
         # implementation
         X_restored = inverse_transform(mach, X_transformed)
         @test isnan(Tables.getcolumn(X_restored, :b)[1])
+
+        # Check that column a still transforms correctly
+        X_restored = inverse_transform(mach, transform(mach, X_empty_fit))
+        @test Tables.getcolumn(X_restored, :a)[1] ≈ 1.0 atol = 1e-9
+        @test Tables.getcolumn(X_restored, :a)[2] ≈ 2.0 atol = 1e-9
+
+        X_all_nan_fit_table = (a=[1.0, 2.0], b=[NaN, NaN])
+        X_all_nan_fit = MLJBase.table(X_all_nan_fit_table)
+        mach_all_nan = machine(transformer, X_all_nan_fit)
+        fit!(mach_all_nan; verbosity=0)
+        fp_nan = fitted_params(mach_all_nan)
+        @test isempty(fp_nan.quantiles_list[2])
+
+        X_all_nan_transformed = transform(mach_all_nan, X_all_nan_fit)
+        @test all(isnan, Tables.getcolumn(X_all_nan_transformed, :b))
+
+        X_all_nan_restored = inverse_transform(mach_all_nan, X_all_nan_transformed)
+        @test all(isnan, Tables.getcolumn(X_all_nan_restored, :b))
+        @test Tables.getcolumn(X_all_nan_restored, :a)[1] ≈ 1.0 atol = 1e-9
+        @test Tables.getcolumn(X_all_nan_restored, :a)[2] ≈ 2.0 atol = 1e-9
     end
 
-    @testset "All non-finite column in fit" begin
-        X_nonfinite_table = (a=[1.0, 2.0], b=[NaN, Inf, -Inf])
-        X_nonfinite = MLJBase.table(X_nonfinite_table)
+    @testset "Single NaN in column" begin
+        X_single_nan_table = (a=[1.0, 2.0, 3.0], b=[0.0, NaN, 1.0])
+        X_single_nan = MLJBase.table(X_single_nan_table)
         transformer = QuantileTransformer()
-        mach = machine(transformer, X_nonfinite)
+        mach = machine(transformer, X_single_nan)
         fit!(mach; verbosity=0)
-        fp = fitted_params(mach)
-        @test isempty(fp.quantiles_list[2]) # No finite values to compute quantiles
 
-        X_new_table = (a=[1.5], b=[10.0])
-        X_new = MLJBase.table(X_new_table)
-        X_transformed = transform(mach, X_new)
-        @test Tables.getcolumn(X_transformed, :b)[1] ≈ 0.5 atol = 1e-9 # Middle of range
+        X_transformed = transform(mach, X_single_nan)
+        b_transformed = Tables.getcolumn(X_transformed, :b)
+        @test b_transformed[1] ≈ 0.0 atol = 1e-9
+        @test isnan(b_transformed[2])
+        @test b_transformed[3] ≈ 1.0 atol = 1e-9
+
+        X_restored = inverse_transform(mach, X_transformed)
+        b_restored = Tables.getcolumn(X_restored, :b)
+        @test b_restored[1] ≈ 0.0 atol = 1e-9
+        @test isnan(b_restored[2])
+        @test b_restored[3] ≈ 1.0 atol = 1e-9
+    end
+
+    @testset "Single Inf in column" begin
+        X_single_inf_table = (a=[1.0, 2.0, 3.0], b=[0.0, Inf, 1.0])
+        X_single_inf = MLJBase.table(X_single_inf_table)
+        transformer = QuantileTransformer()
+        mach = machine(transformer, X_single_inf)
+        @test_throws ErrorException fit!(mach; verbosity=0)
     end
 
     @testset "Column name mismatch" begin

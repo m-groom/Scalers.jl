@@ -173,11 +173,13 @@ MMI.metadata_model(
 
 mutable struct QuantileTransformer <: MMI.Unsupervised
     feature_range::Tuple{Float64,Float64}
+    n_quantiles::Int
 end
 
 # Keyword constructor
-function QuantileTransformer(; feature_range=(0.0, 1.0))
-    transformer = QuantileTransformer(feature_range)
+function QuantileTransformer(; feature_range=(0.0, 1.0), n_quantiles=1000)
+    nq = Int(n_quantiles)
+    transformer = QuantileTransformer(feature_range, nq)
     message = MMI.clean!(transformer)
     isempty(message) || throw(ArgumentError(message))
     return transformer
@@ -188,6 +190,11 @@ function MMI.clean!(transformer::QuantileTransformer)
     if !isempty(err)
         transformer.feature_range = (0.0, 1.0)
     end
+    if transformer.n_quantiles < 1
+        err *= " n_quantiles ($(transformer.n_quantiles)) must be at least 1. Resetting to 1000."
+        transformer.n_quantiles = 1000
+    end
+
     return err
 end
 
@@ -195,28 +202,47 @@ function MMI.fit(transformer::QuantileTransformer, verbosity::Int, X)
     col_names = Tables.columnnames(X)
     # Get promoted element type from all columns
     T = get_promoted_eltype(X)
-    # Pre-allocate result vector with known size
+    # Pre-allocate result vectors with known size
     quantiles_per_column = Vector{Vector{T}}(undef, length(col_names))
+    probabilities_per_column = Vector{Vector{T}}(undef, length(col_names))
+    constant_mask = BitVector(undef, length(col_names))
+    constant_values = Vector{T}(undef, length(col_names))
 
     for (col_idx, name) in enumerate(col_names)
         col_data = Tables.getcolumn(X, name)
-        # Convert to an iterable collection and ensure elements are numbers.
-        col_iterable = if eltype(col_data) <: AbstractFloat
-            collect(T, col_data)
-        else
-            T.(collect(col_data))
+        col_array = _collect_numeric_column(col_data, T)
+
+        if any(isinf, col_array)
+            error("Feature $(name) contains ±Inf values which QuantileTransformer cannot handle.")
         end
-        # Filter non-finite values
-        numeric_col_data = filter(isfinite, col_iterable)
+
+        finite_mask = .!isnan.(col_array)
+        numeric_col_data = col_array[finite_mask]
 
         if isempty(numeric_col_data)
-            quantiles_per_column[col_idx] = T[] # Store empty if no valid data
-        else
-            quantiles_per_column[col_idx] = sort(unique(numeric_col_data))
+            quantiles_per_column[col_idx] = T[]
+            probabilities_per_column[col_idx] = T[]
+            constant_mask[col_idx] = false
+            constant_values[col_idx] = T(NaN)
+            continue
         end
+
+        quantiles, probabilities = _compute_quantile_grid(numeric_col_data, transformer.n_quantiles)
+        quantiles_per_column[col_idx] = quantiles
+        probabilities_per_column[col_idx] = probabilities
+
+        is_const = _is_constant_quantile_grid(quantiles)
+        constant_mask[col_idx] = is_const
+        constant_values[col_idx] = is_const ? quantiles[1] : T(NaN)
     end
 
-    fitresult = (quantiles_list=quantiles_per_column, features=col_names)
+    fitresult = (
+        quantiles_list=quantiles_per_column,
+        probabilities_list=probabilities_per_column,
+        constant_mask=constant_mask,
+        constant_values=constant_values,
+        features=col_names,
+    )
     cache = nothing
     report = nothing
 
@@ -242,23 +268,36 @@ function MMI.transform(transformer::QuantileTransformer, fitresult, Xnew)
 
     for (col_idx, name) in enumerate(Xnew_col_names)
         col_vector = _extract_column_vector(Xnew, name)
+        col_values = _collect_numeric_column(col_vector, T)
 
         # Use feature name to get correct quantiles
         feature_idx = feature_to_idx[name]
         current_quantiles = fitresult.quantiles_list[feature_idx]
-        n_quantiles = length(current_quantiles)
+        current_probabilities = fitresult.probabilities_list[feature_idx]
+        is_constant = fitresult.constant_mask[feature_idx]
 
-        # Process column based on number of quantiles
-        new_col = if n_quantiles == 0
-            _process_empty_quantiles(col_vector, min_range, max_range, T)
-        elseif n_quantiles == 1
-            _process_single_quantile(
-                col_vector, current_quantiles[1], min_range, max_range, range_span, T
-            )
-        else
-            _process_multiple_quantiles(
-                col_vector, current_quantiles, min_range, max_range, range_span, T
-            )
+        new_col = Vector{T}(undef, length(col_values))
+        @inbounds for i in eachindex(col_values)
+            val = col_values[i]
+            if isnan(val)
+                new_col[i] = T(val)
+                continue
+            elseif !isfinite(val)
+                error(
+                    "Input to QuantileTransformer contains ±Inf values which are not supported."
+                )
+            end
+
+            probability = if isempty(current_quantiles)
+                MIDPOINT_PROBABILITY
+            elseif is_constant
+                MIDPOINT_PROBABILITY
+            else
+                _value_to_probability(val, current_quantiles, current_probabilities)
+            end
+
+            scaled_val = range_span == 0.0 ? min_range : probability * range_span + min_range
+            new_col[i] = T(scaled_val)
         end
 
         transformed_cols[col_idx] = new_col
@@ -297,56 +336,42 @@ function MMI.inverse_transform(transformer::QuantileTransformer, fitresult, Xtra
 
     for (col_idx, name) in enumerate(Xtransformed_col_names)
         col_vector = _extract_column_vector(Xtransformed, name)
+        col_values = _collect_numeric_column(col_vector, T)
 
         # Use feature name to get correct quantiles
         feature_idx = feature_to_idx[name]
         current_quantiles = fitresult.quantiles_list[feature_idx]
-        n_quantiles = length(current_quantiles)
+        current_probabilities = fitresult.probabilities_list[feature_idx]
+        is_constant = fitresult.constant_mask[feature_idx]
+        constant_value = fitresult.constant_values[feature_idx]
 
-        new_col = similar(col_vector, T)
-        if n_quantiles == 0
-            fill!(new_col, NaN) # No quantiles, cannot determine original value
-        elseif n_quantiles == 1
-            fill!(new_col, current_quantiles[1]) # All values map to the single quantile
-        else
-            n_quantiles_minus_1 = n_quantiles - 1 # Cache this
-            @inbounds for i in eachindex(col_vector)
-                s_val = col_vector[i]
-                p = zero(T)
-
-                if !isfinite(s_val)
-                    new_col[i] = NaN
-                    continue
-                end
-
-                if range_span == 0.0 # min_range == max_range: use MIDPOINT_PROBABILITY, implying the middle of the ECDF.
-                    p = MIDPOINT_PROBABILITY
-                else
-                    p = (s_val - min_range) * inv_range_span
-                end
-
-                p = clamp(p, zero(T), one(T)) # Ensure p is within [0,1]
-
-                # Interpolate based on p to find the original value from quantiles
-                # idx_float is the fractional index into the quantiles array
-                idx_float = p * n_quantiles_minus_1 + one(T)
-
-                lower_idx = floor(Int, idx_float)
-                upper_idx = ceil(Int, idx_float)
-
-                # Clamp indices to be within bounds of current_quantiles array
-                lower_idx = clamp(lower_idx, 1, n_quantiles)
-                upper_idx = clamp(upper_idx, 1, n_quantiles)
-
-                if lower_idx == upper_idx
-                    new_col[i] = current_quantiles[lower_idx]
-                else
-                    weight = idx_float - lower_idx
-                    val_lower = current_quantiles[lower_idx]
-                    val_upper = current_quantiles[upper_idx]
-                    new_col[i] = (one(T) - weight) * val_lower + weight * val_upper
-                end
+        new_col = Vector{T}(undef, length(col_values))
+        @inbounds for i in eachindex(col_values)
+            s_val = col_values[i]
+            if isnan(s_val)
+                new_col[i] = T(s_val)
+                continue
+            elseif !isfinite(s_val)
+                error(
+                    "Input to QuantileTransformer.inverse_transform contains ±Inf values which are not supported."
+                )
             end
+
+            probability = if range_span == 0.0
+                MIDPOINT_PROBABILITY
+            else
+                clamp((s_val - min_range) * inv_range_span, zero(T), one(T))
+            end
+
+            restored = if isempty(current_quantiles)
+                T(NaN)
+            elseif is_constant
+                constant_value
+            else
+                _probability_to_value(probability, current_quantiles, current_probabilities)
+            end
+
+            new_col[i] = T(restored)
         end
         original_cols[col_idx] = new_col
     end
@@ -363,82 +388,115 @@ function MMI.inverse_transform(transformer::QuantileTransformer, fitresult, Xtra
 end
 
 # Helpers
-function _process_empty_quantiles(col_vector, min_range, max_range, T::Type)
-    new_col = similar(col_vector, T)
-    fill!(new_col, (min_range + max_range) * MIDPOINT_PROBABILITY)
-    return new_col
-end
-
-function _process_single_quantile(
-    col_vector, quantile_value, min_range, max_range, range_span, T::Type
-)
-    new_col = similar(col_vector, T)
-    q_val = quantile_value
-    @inbounds for i in eachindex(col_vector)
-        val = float(col_vector[i])
-        p = if !isfinite(val)
-            MIDPOINT_PROBABILITY
-        elseif val < q_val
-            zero(T)
-        elseif val > q_val
-            one(T)
-        else # val == q_val
-            MIDPOINT_PROBABILITY # Convention for single quantile: map to midpoint
-        end
-        new_col[i] = p * range_span + min_range
-    end
-    return new_col
-end
-
-function _interpolate_quantile_value(val, quantiles, inv_n_quantiles_minus_1, T::Type)
-    # Find insertion point
-    idx = searchsortedlast(quantiles, val)
-    q_i = quantiles[idx]
-    p_i = (idx - 1) * inv_n_quantiles_minus_1
-
-    if val == q_i # Value falls exactly on a quantile
-        return p_i
-    else # Interpolate between q_i and q_i_plus_1
-        q_i_plus_1 = quantiles[idx + 1]
-        p_i_plus_1 = idx * inv_n_quantiles_minus_1
-
-        denominator = q_i_plus_1 - q_i
-        fraction = denominator == zero(T) ? zero(T) : (val - q_i) / denominator
-        return p_i + fraction * (p_i_plus_1 - p_i)
-    end
-end
-
-function _process_multiple_quantiles(
-    col_vector, quantiles, min_range, max_range, range_span, T::Type
-)
-    new_col = similar(col_vector, T)
-    q_min = quantiles[1]
-    q_max = quantiles[end]
-    n_quantiles = length(quantiles)
-    # Pre-calculate inverse of (n_quantiles - 1) to avoid repeated division
-    inv_n_quantiles_minus_1 = one(T) / (n_quantiles - 1)
-
-    @inbounds for i in eachindex(col_vector)
-        val = float(col_vector[i])
-        p = zero(T)
-
-        if !isfinite(val)
-            p = MIDPOINT_PROBABILITY # Convention for non-finite values: map to midpoint of target range
-        elseif val <= q_min
-            p = zero(T)
-        elseif val >= q_max
-            p = one(T)
+function _collect_numeric_column(column_data, T::Type{<:AbstractFloat})
+    col_iterable = column_data isa AbstractVector ? column_data : collect(column_data)
+    result = Vector{T}(undef, length(col_iterable))
+    @inbounds for (idx, value) in enumerate(col_iterable)
+        if value === missing
+            result[idx] = T(NaN)
         else
-            p = _interpolate_quantile_value(val, quantiles, inv_n_quantiles_minus_1, T)
+            result[idx] = T(value)
         end
-        new_col[i] = p * range_span + min_range
     end
-    return new_col
+    return result
+end
+
+function _compute_quantile_grid(values::Vector{T}, n_quantiles::Int) where {T<:AbstractFloat}
+    sorted_vals = sort(values)
+    n_samples = length(sorted_vals)
+    n_quantiles_eff = max(2, min(n_quantiles, n_samples))
+    probabilities = collect(range(zero(T), one(T); length=n_quantiles_eff))
+    quantiles = Vector{T}(undef, n_quantiles_eff)
+
+    if n_samples == 1
+        fill!(quantiles, sorted_vals[1])
+        return quantiles, probabilities
+    end
+
+    @inbounds for (idx, p) in enumerate(probabilities)
+        if p <= zero(T)
+            quantiles[idx] = sorted_vals[1]
+        elseif p >= one(T)
+            quantiles[idx] = sorted_vals[end]
+        else
+            position = (n_samples - 1) * p + 1
+            lower_idx = floor(Int, position)
+            upper_idx = ceil(Int, position)
+            weight = position - lower_idx
+            lower_val = sorted_vals[lower_idx]
+            upper_val = sorted_vals[upper_idx]
+            quantiles[idx] = (1 - weight) * lower_val + weight * upper_val
+        end
+    end
+
+    return quantiles, probabilities
+end
+
+function _is_constant_quantile_grid(quantiles::Vector{T}) where {T<:AbstractFloat}
+    isempty(quantiles) && return false
+    q_min = minimum(quantiles)
+    q_max = maximum(quantiles)
+    return isapprox(q_min, q_max; atol=eps(T) * max(one(T), abs(q_min)))
+end
+
+function _value_to_probability(
+    val::T, quantiles::Vector{T}, probabilities::Vector{T}
+) where {T<:AbstractFloat}
+    if val <= quantiles[1]
+        return zero(T)
+    elseif val >= quantiles[end]
+        return one(T)
+    end
+
+    idx = searchsortedlast(quantiles, val)
+    idx = clamp(idx, 1, length(quantiles) - 1)
+    upper_idx = idx + 1
+    q_low = quantiles[idx]
+    q_high = quantiles[upper_idx]
+    p_low = probabilities[idx]
+    p_high = probabilities[upper_idx]
+
+    if q_high == q_low
+        return (p_low + p_high) / 2
+    else
+        t = (val - q_low) / (q_high - q_low)
+        return p_low + t * (p_high - p_low)
+    end
+end
+
+function _probability_to_value(
+    probability::T, quantiles::Vector{T}, probabilities::Vector{T}
+) where {T<:AbstractFloat}
+    if probability <= probabilities[1]
+        return quantiles[1]
+    elseif probability >= probabilities[end]
+        return quantiles[end]
+    end
+
+    idx = searchsortedlast(probabilities, probability)
+    idx = clamp(idx, 1, length(probabilities) - 1)
+    upper_idx = idx + 1
+    p_low = probabilities[idx]
+    p_high = probabilities[upper_idx]
+    q_low = quantiles[idx]
+    q_high = quantiles[upper_idx]
+
+    if p_high == p_low
+        return T(0.5) * (q_low + q_high)
+    else
+        t = (probability - p_low) / (p_high - p_low)
+        return q_low + t * (q_high - q_low)
+    end
 end
 
 # Fitted parameters
 function MMI.fitted_params(::QuantileTransformer, fitresult)
-    return (quantiles_list=fitresult.quantiles_list,)
+    return (
+        quantiles_list=fitresult.quantiles_list,
+        probabilities_list=fitresult.probabilities_list,
+        constant_mask=fitresult.constant_mask,
+        constant_values=fitresult.constant_values,
+    )
 end
 
 # MLJ traits
@@ -482,6 +540,9 @@ Train the machine using `fit!(mach, rows=...)`.
 
 - `feature_range::Tuple{Float64, Float64}`: The desired range for the transformed data.
   Defaults to `(0.0, 1.0)`.
+
+- `n_quantiles::Int`: The number of points used to approximate the ECDF. Defaults to
+  `1000`, is capped by the number of observed samples, and is enforced to be at least 2.
 
 
 # Operations
@@ -574,9 +635,10 @@ $(MMI.doc_header(QuantileTransformer))
 Use this model to transform features to be uniformly distributed over a given range,
 defaulting to [0, 1]. This transformation maps each feature to a uniform distribution
 by calculating the empirical cumulative distribution function (ECDF) of the training
-data. The rescalings applied by this transformer to new data are always those learned
-during the training phase. The behaviour of this model is similar to that of the
-`QuantileTransformer` in the `sklearn.preprocessing` Python package.
+data using rank-based percentiles. The rescalings applied by this transformer to new
+data are always those learned during the training phase. The behaviour of this model
+is similar to that of the `QuantileTransformer` in the `sklearn.preprocessing` Python
+package.
 
 
 # Training data
@@ -600,19 +662,24 @@ Train the machine using `fit!(mach, rows=...)`.
 - `feature_range::Tuple{Float64, Float64}`: The desired range for the transformed data.
   Defaults to `(0.0, 1.0)`.
 
+- `n_quantiles::Int`: The number of points used to approximate the ECDF. Defaults to
+  `1000`, is capped by the number of observed samples, and is enforced to be at least 2.
+
 
 # Operations
 
-- `transform(mach, Xnew)`: return `Xnew` with features transformed to uniform
-  distribution over the specified `feature_range` according to the quantiles
-  learned during fitting of `mach`. For out-of-sample values, those smaller than
-  the training minimum are mapped to the lower bound of `feature_range`, and those
-  larger than the training maximum are mapped to the upper bound. Interpolation is
-  used for values falling between learned quantile values.
+- `transform(mach, Xnew)`: return `Xnew` with features transformed to a uniform
+  distribution over the specified `feature_range` according to the quantile grid
+  learned during fitting of `mach`. Values below/above the fitted range are mapped
+  to the bounds of `feature_range`, constant training features map to the midpoint
+  of that range, columns with no finite training values map to that same midpoint,
+  `NaN` values are propagated, and ±`Inf` inputs raise an error.
 
 - `inverse_transform(mach, Z)`: apply the inverse transformation to `Z`, mapping
   values from `feature_range` back to the original feature domain using linear
-  interpolation between the quantiles learned during `fit`.
+  interpolation between the stored quantile grid. Constant features revert to the
+  fitted constant value, columns with no finite training values yield `NaN`, `NaN`
+  values are propagated, and ±`Inf` inputs raise an error.
 
 
 # Fitted parameters
@@ -621,7 +688,11 @@ The fields of `fitted_params(mach)` are:
 
 - `quantiles_list` - vector of quantile arrays, one for each feature column
 
-- `col_names` - the names of features that were fitted
+- `probabilities_list` - vector of probability grids paired with each quantile array
+
+- `constant_mask` - boolean vector indicating which feature columns were constant during fitting
+
+- `constant_values` - vector storing the fitted constant value for constant feature columns (NaN otherwise)
 
 
 # Examples
