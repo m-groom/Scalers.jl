@@ -99,7 +99,7 @@ transformer = QuantileTransformer(n_quantiles=10)
 mach = machine(transformer, X)
 fit!(mach)
 
-X_transformed = transform(mach, X)
+X_transformed = MLJBase.transform(mach, X)
 println(X_transformed)
 
 # Examine learned quantiles
